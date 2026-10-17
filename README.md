@@ -22,7 +22,7 @@ py -3.11 -m venv .venv
 pip install -r requirements.txt
 pip install -e .
 
-cp .env.example .env          # then edit .env and paste your API key
+copy .env.example .env        # then edit .env and paste your API key
 python -m weather_pipeline.pipeline
 ```
 
@@ -48,13 +48,15 @@ production, a secrets manager (Key Vault, Secrets Manager, Vault) would
 inject the same variable at runtime — the code path does not change.
 
 > **Windows notes.** Two Windows-specific setup steps are needed:
-> 1. PySpark 3.5.x's bundled `cloudpickle` is incompatible with Python 3.13+,
->    and Spark workers must use the venv interpreter rather than the Microsoft
->    Store `python` alias. `conftest.py` sets `PYSPARK_PYTHON` from
->    `sys.executable` to make this reproducible.
-> 2. Writing Parquet requires `winutils.exe` and `hadoop.dll` (Hadoop 3.3.5)
->    on `PATH`. Place them at `C:\hadoop\bin`, set `HADOOP_HOME=C:\hadoop`,
->    and prepend `C:\hadoop\bin` to `PATH` before running the pipeline.
+> 1. PySpark 3.5.x's bundled `cloudpickle` is incompatible with Python 3.13+, 
+>    and Spark workers must use the venv interpreter rather than the Microsoft 
+>    Store `python` alias. Both `pipeline.py` and `conftest.py` set 
+>    `PYSPARK_PYTHON` from `sys.executable` at import time to prevent this.
+> 2. Writing Parquet requires `winutils.exe` and `hadoop.dll` (Hadoop 3.3.5) 
+>    on `PATH`. Place them at `C:\hadoop\bin`. The pipeline will automatically 
+>    detect this location and configure `HADOOP_HOME` and `PATH` for you. 
+>    (If installed elsewhere, set `HADOOP_HOME` and prepend its `bin` folder 
+>    to `PATH` manually).
 
 ## Approach: IDs and incremental loading
 
