@@ -1,0 +1,5 @@
+requests
+pytest
+pyspark==3.5.1
+pyarrow
+python-dotenv
