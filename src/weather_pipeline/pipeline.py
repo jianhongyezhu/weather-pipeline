@@ -22,17 +22,18 @@ if sys.platform == "win32":
 import logging
 import time
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 
 import requests
 from dotenv import load_dotenv
 from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
 
 from weather_pipeline.country_clients import fetch_eu_country_metadata
 from weather_pipeline.transform import (
     build_cities_df,
     build_weather_df,
     merge_and_window,
+    reclassify_forecast_status,
     write_parquet,
 )
 from weather_pipeline.weather_client import (
@@ -54,16 +55,17 @@ INTER_CITY_DELAY_SECONDS = 0.25
 def _with_retry(fn, *args, **kwargs):
     """Retry transient HTTP failures with exponential backoff.
 
-    Retries 5xx and connection/timeout errors only — a 4xx will never
-    succeed on retry. Honours Retry-After when the server provides it.
-    Non-HTTP exceptions (ValueError, KeyError, ...) propagate immediately.
+    Retries HTTP 429, 5xx, and connection/timeout errors. Other 4xx responses
+    and non-HTTP exceptions (ValueError, KeyError, ...) propagate immediately.
+    Honours both integer and HTTP-date forms of Retry-After.
     """
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             return fn(*args, **kwargs)
         except requests.HTTPError as exc:
             status = exc.response.status_code if exc.response is not None else None
-            if status is not None and 400 <= status < 500:
+            retryable = status == 429 or (status is not None and status >= 500)
+            if not retryable:
                 raise  # client error — retrying won't help
             if attempt == MAX_ATTEMPTS:
                 raise
@@ -74,7 +76,16 @@ def _with_retry(fn, *args, **kwargs):
                     try:
                         delay = max(delay, int(retry_after))
                     except ValueError:
-                        pass  # HTTP-date format; ignore
+                        try:
+                            retry_at = parsedate_to_datetime(retry_after)
+                            if retry_at.tzinfo is None:
+                                retry_at = retry_at.replace(tzinfo=UTC)
+                            delay = max(
+                                delay,
+                                int((retry_at - datetime.now(UTC)).total_seconds()),
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            pass  # Invalid Retry-After header; use backoff.
             log.warning(
                 "%s failed (attempt %s/%s, status %s), retrying in %ss",
                 fn.__name__, attempt, MAX_ATTEMPTS, status, delay,
@@ -95,9 +106,9 @@ def run(spark: SparkSession, output_dir: str = "data",
         now: datetime | None = None) -> tuple:
     """Execute one pipeline run.
 
-    Builds both DataFrames fully in memory before writing anything, so a
-    failure in the middle of the weather loop leaves the previous hour's
-    Parquet files intact rather than partially overwritten.
+    Builds both DataFrames before writing. API/extraction failures therefore
+    happen before either output is touched. The two subsequent Parquet writes
+    are independent, however, so a write failure can leave a mixed snapshot.
     """
     now = now or datetime.now(UTC)
 
@@ -139,9 +150,7 @@ def run(spark: SparkSession, output_dir: str = "data",
             time.sleep(INTER_CITY_DELAY_SECONDS)
 
     weather_df = build_weather_df(spark, records)
-    weather_df = weather_df.withColumn(
-        "is_forecast", F.col("timestamp_utc") > F.lit(now)
-    )
+    weather_df = reclassify_forecast_status(weather_df, now)
     weather_df = merge_and_window(weather_df, now=now)
 
     # --- write both, only after everything succeeded -------------------------

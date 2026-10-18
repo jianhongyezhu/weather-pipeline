@@ -132,3 +132,14 @@ def merge_and_window(weather_df: DataFrame, now: datetime | None = None) -> Data
 def write_parquet(df: DataFrame, path: str) -> None:
     """Single-file overwrite: idempotent by construction."""
     df.coalesce(1).write.mode("overwrite").parquet(path)
+
+
+def reclassify_forecast_status(
+    weather_df: DataFrame,
+    now: datetime,
+) -> DataFrame:
+    """Classify weather rows relative to the current pipeline run."""
+    return weather_df.withColumn(
+        "is_forecast",
+        F.col("timestamp_utc") > F.lit(now),
+    )
