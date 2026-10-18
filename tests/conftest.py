@@ -17,6 +17,7 @@ def spark():
         SparkSession.builder
         .master("local[1]")
         .appName("weather-pipeline-tests")
+        .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", "1")
         .config("spark.ui.enabled", "false")
         .config("spark.driver.host", "127.0.0.1")
