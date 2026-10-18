@@ -1,3 +1,4 @@
+
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -23,14 +24,17 @@ COUNTRIES = [
 
 def _weather(spark, city_id, when, temp, is_forecast):
     return build_weather_df(spark, [{
-        "city_id": city_id, "timestamp_utc": when,
-        "temperature_celsius": temp, "is_forecast": is_forecast,
+        "city_id": city_id,
+        "timestamp_utc": when,
+        "temperature_celsius": temp,
+        "is_forecast": is_forecast,
     }])
 
 
 def test_city_ids_are_deterministic_and_non_negative(spark):
     first = build_cities_df(spark, COUNTRIES).collect()
     second = build_cities_df(spark, COUNTRIES).collect()
+
     assert first == second
     assert all(row.city_id >= 0 for row in first)
     assert len({row.city_id for row in first}) == len(first)
@@ -41,7 +45,9 @@ def test_actual_beats_forecast_for_same_hour(spark):
     forecast = _weather(spark, 1, when, 20.0, True)
     actual = _weather(spark, 1, when, 18.5, False)
 
-    rows = merge_and_window(forecast.unionByName(actual), now=NOW).collect()
+    rows = merge_and_window(
+        forecast.unionByName(actual), now=NOW
+    ).collect()
 
     assert len(rows) == 1
     assert rows[0].temperature_celsius == 18.5
@@ -53,16 +59,24 @@ def test_null_actual_does_not_mask_forecast(spark):
     forecast = _weather(spark, 1, when, 20.0, True)
     actual = _weather(spark, 1, when, None, False)
 
-    rows = merge_and_window(forecast.unionByName(actual), now=NOW).collect()
+    rows = merge_and_window(
+        forecast.unionByName(actual), now=NOW
+    ).collect()
 
     assert len(rows) == 1
     assert rows[0].temperature_celsius == 20.0
 
 
 def test_rolling_window_truncation(spark):
-    in_range = _weather(spark, 1, NOW - timedelta(days=1), 10.0, False)
-    too_old = _weather(spark, 1, NOW - timedelta(days=91), 10.0, False)
-    too_new = _weather(spark, 1, NOW + timedelta(days=8), 10.0, True)
+    in_range = _weather(
+        spark, 1, NOW - timedelta(days=1), 10.0, False
+    )
+    too_old = _weather(
+        spark, 1, NOW - timedelta(days=91), 10.0, False
+    )
+    too_new = _weather(
+        spark, 1, NOW + timedelta(days=8), 10.0, True
+    )
 
     rows = merge_and_window(
         in_range.unionByName(too_old).unionByName(too_new),
@@ -79,14 +93,30 @@ def test_rolling_window_includes_exact_boundaries_and_excludes_outside(spark):
     end = NOW + timedelta(days=7)
 
     records = [
-        {"city_id": 1, "timestamp_utc": start - timedelta(microseconds=1),
-         "temperature_celsius": 1.0, "is_forecast": False},
-        {"city_id": 1, "timestamp_utc": start,
-         "temperature_celsius": 2.0, "is_forecast": False},
-        {"city_id": 1, "timestamp_utc": end,
-         "temperature_celsius": 3.0, "is_forecast": True},
-        {"city_id": 1, "timestamp_utc": end + timedelta(microseconds=1),
-         "temperature_celsius": 4.0, "is_forecast": True},
+        {
+            "city_id": 1,
+            "timestamp_utc": start - timedelta(microseconds=1),
+            "temperature_celsius": 1.0,
+            "is_forecast": False,
+        },
+        {
+            "city_id": 1,
+            "timestamp_utc": start,
+            "temperature_celsius": 2.0,
+            "is_forecast": False,
+        },
+        {
+            "city_id": 1,
+            "timestamp_utc": end,
+            "temperature_celsius": 3.0,
+            "is_forecast": True,
+        },
+        {
+            "city_id": 1,
+            "timestamp_utc": end + timedelta(microseconds=1),
+            "temperature_celsius": 4.0,
+            "is_forecast": True,
+        },
     ]
 
     result = merge_and_window(
@@ -94,14 +124,15 @@ def test_rolling_window_includes_exact_boundaries_and_excludes_outside(spark):
         now=NOW,
     )
 
-    # Compare UTC instants rather than Python datetime representations.
-    # This avoids local timezone offsets when Spark returns timestamps.
+    # Compare UTC instants, not Python datetime representations.
     actual = {
         row.timestamp_epoch
         for row in (
             result
             .select(
-                F.col("timestamp_utc").cast("long").alias("timestamp_epoch")
+                F.col("timestamp_utc")
+                .cast("long")
+                .alias("timestamp_epoch")
             )
             .collect()
         )
@@ -114,13 +145,28 @@ def test_rolling_window_includes_exact_boundaries_and_excludes_outside(spark):
 
     assert actual == expected
 
+    # Unix-second conversion loses microsecond precision.
+    # Verify that the two outside rows were actually excluded.
+    rows = result.select("temperature_celsius").collect()
+
+    assert len(rows) == 2
+    assert {row.temperature_celsius for row in rows} == {2.0, 3.0}
+
 
 def test_rerun_is_idempotent(spark):
     records = [
-        {"city_id": 1, "timestamp_utc": NOW - timedelta(hours=2),
-         "temperature_celsius": 12.0, "is_forecast": False},
-        {"city_id": 1, "timestamp_utc": NOW + timedelta(hours=5),
-         "temperature_celsius": 15.5, "is_forecast": True},
+        {
+            "city_id": 1,
+            "timestamp_utc": NOW - timedelta(hours=2),
+            "temperature_celsius": 12.0,
+            "is_forecast": False,
+        },
+        {
+            "city_id": 1,
+            "timestamp_utc": NOW + timedelta(hours=5),
+            "temperature_celsius": 15.5,
+            "is_forecast": True,
+        },
     ]
 
     run_1 = merge_and_window(
@@ -131,17 +177,24 @@ def test_rerun_is_idempotent(spark):
     ).collect()
 
     assert run_1 == run_2
-    assert len({(r.city_id, r.timestamp_utc) for r in run_1}) == len(run_1)
+    assert len({
+        (r.city_id, r.timestamp_utc) for r in run_1
+    }) == len(run_1)
 
 
 def test_forecast_timestamp_becomes_historical_as_reference_time_advances(spark):
     forecast_time = NOW + timedelta(hours=1)
+
     forecast = build_weather_df(spark, [{
-        "city_id": 1, "timestamp_utc": forecast_time,
-        "temperature_celsius": 15.0, "is_forecast": True,
+        "city_id": 1,
+        "timestamp_utc": forecast_time,
+        "temperature_celsius": 15.0,
+        "is_forecast": True,
     }])
 
-    first_run = reclassify_forecast_status(forecast, NOW).collect()
+    first_run = reclassify_forecast_status(
+        forecast, NOW
+    ).collect()
     second_run = reclassify_forecast_status(
         forecast, NOW + timedelta(hours=2)
     ).collect()
@@ -152,19 +205,26 @@ def test_forecast_timestamp_becomes_historical_as_reference_time_advances(spark)
 
 def test_conflicting_equal_precedence_temperatures_fail(spark):
     when = NOW - timedelta(hours=1)
+
     first = build_weather_df(spark, [{
-        "city_id": 1, "timestamp_utc": when,
-        "temperature_celsius": 10.0, "is_forecast": False,
+        "city_id": 1,
+        "timestamp_utc": when,
+        "temperature_celsius": 10.0,
+        "is_forecast": False,
         "source_priority": 0,
     }])
     second = build_weather_df(spark, [{
-        "city_id": 1, "timestamp_utc": when,
-        "temperature_celsius": 12.0, "is_forecast": False,
+        "city_id": 1,
+        "timestamp_utc": when,
+        "temperature_celsius": 12.0,
+        "is_forecast": False,
         "source_priority": 0,
     }])
 
     with pytest.raises(ValueError, match="Conflicting temperatures"):
-        merge_and_window(first.unionByName(second), now=NOW).collect()
+        merge_and_window(
+            first.unionByName(second), now=NOW
+        ).collect()
 
 
 def test_id_collision_check_fails_for_distinct_business_keys(spark):
@@ -175,25 +235,34 @@ def test_id_collision_check_fails_for_distinct_business_keys(spark):
 
     with pytest.raises(ValueError, match="City ID collision detected"):
         assert_no_id_collisions(
-            df, "city_id", ["country_code", "city_name"], "City"
+            df,
+            "city_id",
+            ["country_code", "city_name"],
+            "City",
         )
 
 
 def test_archive_beats_forecast_past_days_on_overlap(spark):
     when = NOW - timedelta(days=2)
+
     archive = build_weather_df(spark, [{
-        "city_id": 1, "timestamp_utc": when,
-        "temperature_celsius": 11.0, "is_forecast": False,
+        "city_id": 1,
+        "timestamp_utc": when,
+        "temperature_celsius": 11.0,
+        "is_forecast": False,
         "source_priority": 0,
     }])
     forecast_past = build_weather_df(spark, [{
-        "city_id": 1, "timestamp_utc": when,
-        "temperature_celsius": 13.0, "is_forecast": False,
+        "city_id": 1,
+        "timestamp_utc": when,
+        "temperature_celsius": 13.0,
+        "is_forecast": False,
         "source_priority": 1,
     }])
 
     rows = merge_and_window(
-        archive.unionByName(forecast_past), now=NOW
+        archive.unionByName(forecast_past),
+        now=NOW,
     ).collect()
 
     assert len(rows) == 1
