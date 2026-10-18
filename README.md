@@ -8,8 +8,11 @@ and hourly temperatures from **Open-Meteo**, then writes two Parquet files:
 | `data/cities.parquet` | Dimension table: one row per EU capital |
 | `data/weather.parquet` | Fact table: last 90 days of history + next 7 days of forecast |
 
-The pipeline is designed to run **once per hour**. Re-running it at any point
-produces a consistent dataset with no duplicate records.
+The pipeline is designed to run **once per hour**. It rebuilds a rolling
+snapshot on each run, deduplicates each city-hour, and allows updated forecasts
+to replace earlier forecasts. Identical inputs and a fixed reference time
+produce equivalent logical rows; live runs can differ because forecasts and
+the rolling-window boundaries change.
 
 ## How to run
 
@@ -63,36 +66,48 @@ inject the same variable at runtime — the code path does not change.
 **Deterministic IDs.** Both keys are hashes of business attributes, not
 auto-increments:
 
-- `city_id = pmod(murmur3(country_code | city_name), 2^31-1)`
-- `weather_id = pmod(murmur3(city_id | timestamp_utc), 2^31-1)`
+- `city_id = pmod(Spark hash(country_code, city_name), 2^31-1)`
+- `weather_id = pmod(Spark hash(city_id, timestamp_utc), 2^31-1)`
 
-Any hourly run, on any machine, produces the same key for the same logical
-record. That is what makes re-runs safe.
+These are deterministic non-negative integer IDs for a given Spark hash
+implementation and normalized input. A finite-width hash is not collision-free,
+so the pipeline checks that distinct city keys and distinct output weather keys
+do not share an ID; a detected collision fails the run rather than silently
+publishing ambiguous IDs. This is a guard, not a collision-resolution scheme.
 
-**Incremental loading is enforced at the write layer, not the extract layer.**
+**Loading strategy: full snapshot, not incremental extraction.**
 Neither API supports delta extraction (REST Countries returns a snapshot;
 Open-Meteo returns a date range). At ~27 cities × ~97 days × 24 hours ≈ 62k
-rows, a full re-fetch costs a few seconds and a few MB, so the pipeline
-deliberately re-fetches each run and makes the *write* idempotent:
+rows, a full re-fetch is a simple choice for this take-home. The pipeline
+deliberately re-fetches each run and applies these rules:
 
 1. All records are unioned into one DataFrame.
 2. `row_number()` over `(city_id, timestamp_utc)` keeps exactly one row per
    hour, ordered by `is_forecast` (actuals first), then `source_priority`
-   (archive before forecast endpoint), then non-null temperature.
+  (archive before forecast endpoint). If equally preferred records disagree
+  on temperature, the run fails rather than silently choosing a value.
 3. The result is filtered to `[now - 90 days, now + 7 days]`.
-4. The file is written with `.mode("overwrite")` and `coalesce(1)`.
+4. Stable IDs are checked for collisions, then each output is written with
+  `.mode("overwrite")` and `coalesce(1)`.
 
-Two runs in the same hour therefore produce the same content. (Row order
-within the single part file is not guaranteed by Spark; the idempotency test
-compares content, not file bytes.)
+This avoids accumulating duplicates across runs. It does **not** promise that
+two live runs have identical content: the upstream forecast can change, and
+the rolling window moves with `now`. The idempotency test fixes `now` and the
+input data, then compares logical rows rather than file bytes or row order.
 
 **Failure handling.** Failed API calls retry with exponential backoff (5
-attempts, honouring `Retry-After` on 5xx). If retries are exhausted, the run
-aborts before any file is written — the previous hour's Parquet files remain
-intact. The invariant is that the dataset is always a complete snapshot,
-never a partial one. This is the **Fail-Fast** pattern from *Data Engineering
-Design Patterns* (Konieczny, Ch. 3), equivalent to Kimball's *Recovery and
-Restart System* (Subsystem 23).
+attempts, retrying HTTP 429 and 5xx responses and honouring integer or HTTP-date `Retry-After` values when valid).
+If a required API call fails after retries, extraction aborts before either
+output is written. However, the two output writes are independent: if the city
+write succeeds and the weather write then fails, the published files can
+represent different runs. This small solution does not provide atomic
+publication of the pair.
+
+If consumers required a consistent multi-file snapshot, the next step would be
+to write both datasets to a new versioned staging directory, validate them,
+and publish the completed snapshot through a single commit or pointer update
+supported by the target storage system. Two independent file renames alone
+would not guarantee atomic publication of the pair.
 
 ## How forecasts changing and becoming historical are handled
 
@@ -118,8 +133,8 @@ Restart System* (Subsystem 23).
   conversion is needed downstream.
 - `timestamp_utc` is stored as a Spark timestamp. Values are UTC by
   construction (Open-Meteo is queried with `timezone=UTC`, parsing uses
-  `tzinfo=UTC`, and the SparkSession sets `spark.sql.session.timeZone=UTC`);
-  the column name is the contract.
+  `tzinfo=UTC`, and both the production and test Spark sessions set
+  `spark.sql.session.timeZone=UTC`); the column name is the contract.
 - Rows with a null temperature are dropped: a null must not mask a real
   reading during deduplication.
 - Open-Meteo's forecast endpoint returns 7 *calendar* days starting from the
@@ -138,9 +153,10 @@ Brief notes; the interview will cover each in more depth.
   checkpoint per-city responses so a failed call falls back to the last
   successful response rather than aborting the run — i.e. add a **Dead-Letter
   Queue** (Konieczny Ch. 3; Kimball Subsystem 24).
-- Move from plain Parquet overwrite to **Delta Lake** and use `MERGE` on
-  `(city_id, timestamp_utc)`, so historical partitions are not rewritten and
-  the write becomes atomic for concurrent readers.
+- If per-table transactional writes and incremental updates become necessary,
+  consider **Delta Lake** and `MERGE` on `(city_id, timestamp_utc)`. A Delta
+  transaction would protect an individual table; two separate tables still
+  need a publication strategy if consumers require an atomic pair.
 - Partition `weather.parquet` by `country_code` (or `date`) to avoid
   single-file scaling limits.
 - To retain the forecast known at each point in time, add a `forecast_run_ts`
