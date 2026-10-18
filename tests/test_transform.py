@@ -1,4 +1,3 @@
-
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -124,7 +123,6 @@ def test_rolling_window_includes_exact_boundaries_and_excludes_outside(spark):
         now=NOW,
     )
 
-    # Compare UTC instants, not Python datetime representations.
     actual = {
         row.timestamp_epoch
         for row in (
@@ -145,8 +143,6 @@ def test_rolling_window_includes_exact_boundaries_and_excludes_outside(spark):
 
     assert actual == expected
 
-    # Unix-second conversion loses microsecond precision.
-    # Verify that the two outside rows were actually excluded.
     rows = result.select("temperature_celsius").collect()
 
     assert len(rows) == 2
@@ -267,3 +263,84 @@ def test_archive_beats_forecast_past_days_on_overlap(spark):
 
     assert len(rows) == 1
     assert rows[0].temperature_celsius == 11.0
+
+
+def test_weather_ids_are_sequential_and_deterministic(spark):
+    records = [
+        {
+            "city_id": 2,
+            "timestamp_utc": NOW + timedelta(hours=1),
+            "temperature_celsius": 20.0,
+            "is_forecast": True,
+        },
+        {
+            "city_id": 1,
+            "timestamp_utc": NOW - timedelta(hours=1),
+            "temperature_celsius": 10.0,
+            "is_forecast": False,
+        },
+        {
+            "city_id": 1,
+            "timestamp_utc": NOW + timedelta(hours=2),
+            "temperature_celsius": 12.0,
+            "is_forecast": True,
+        },
+    ]
+
+    first = merge_and_window(
+        build_weather_df(spark, records),
+        now=NOW,
+    )
+    second = merge_and_window(
+        build_weather_df(spark, list(reversed(records))),
+        now=NOW,
+    )
+
+    first_rows = first.orderBy(
+        "city_id", "timestamp_utc"
+    ).collect()
+    second_rows = second.orderBy(
+        "city_id", "timestamp_utc"
+    ).collect()
+
+    assert first_rows == second_rows
+    assert [row.weather_id for row in first_rows] == [1, 2, 3]
+    assert len({
+        row.weather_id for row in first_rows
+    }) == len(first_rows)
+
+    assert dict(first.dtypes)["weather_id"] == "int"
+
+
+def test_weather_ids_can_shift_when_snapshot_changes(spark):
+    retained = {
+        "city_id": 1,
+        "timestamp_utc": NOW - timedelta(hours=2),
+        "temperature_celsius": 12.0,
+        "is_forecast": False,
+    }
+    earlier = {
+        "city_id": 1,
+        "timestamp_utc": NOW - timedelta(hours=3),
+        "temperature_celsius": 11.0,
+        "is_forecast": False,
+    }
+
+    first = merge_and_window(
+        build_weather_df(spark, [retained]),
+        now=NOW,
+    ).collect()
+
+    second = merge_and_window(
+        build_weather_df(spark, [earlier, retained]),
+        now=NOW,
+    ).collect()
+
+    assert first[0].weather_id == 1
+
+    retained_in_second = next(
+        row for row in second
+        if row.temperature_celsius == 12.0
+    )
+
+    assert retained_in_second.weather_id == 2

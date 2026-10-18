@@ -1,4 +1,3 @@
-
 # EU Capital Weather Pipeline
 
 PySpark pipeline that fetches EU capital city metadata from **REST Countries**
@@ -41,8 +40,8 @@ pytest -q
 ```
 
 The suite covers the two API clients (mocked, no network), the transform
-logic (dedup precedence, rolling window, idempotency), and runs against a
-local `SparkSession` configured in `tests/conftest.py`.
+logic (dedup precedence, rolling window, idempotency, ID generation), and
+runs against a local `SparkSession` configured in `tests/conftest.py`.
 
 ### Secrets
 
@@ -64,41 +63,79 @@ inject the same variable at runtime — the code path does not change.
 
 ## Approach: IDs and incremental loading
 
-**Deterministic IDs.** Both keys are hashes of business attributes, not
-auto-increments:
+**City IDs.**
 
-- `city_id = pmod(Spark hash(country_code, city_name), 2^31-1)`
-- `weather_id = pmod(Spark hash(city_id, timestamp_utc), 2^31-1)`
+`city_id` is a deterministic, non-negative integer derived from the city's
+business key:
 
-These are deterministic non-negative integer IDs for a given Spark hash
-implementation and normalized input. A finite-width hash is not collision-free,
-so the pipeline checks that distinct city keys and distinct output weather keys
-do not share an ID; a detected collision fails the run rather than silently
-publishing ambiguous IDs. This is a guard, not a collision-resolution scheme.
+`city_id = pmod(Spark hash(country_code, city_name), 2^31-1)`
+
+Spark's finite-width hash can collide. The pipeline checks that distinct
+city business keys do not share an ID and fails if a collision is detected.
+
+The city ID is reproducible for the same normalized input and Spark hash
+implementation.
+
+**Weather IDs.**
+
+`weather_id` is a sequential positive integer assigned after weather records
+have been filtered and deduplicated:
+
+`weather_id = row_number() over (order by city_id, timestamp_utc)`
+
+The resulting IDs are:
+
+- **Unique within each snapshot.** Each published weather row receives a
+  different integer ID.
+- **Deterministic for a fixed snapshot.** Identical final business keys
+  receive the same IDs regardless of input record order.
+- **Not stable across snapshots.** When earlier city-hours enter or leave the
+  rolling window, IDs of existing rows can shift.
+
+The stable logical business key for a weather observation is
+`(city_id, timestamp_utc)`. Consumers must not use `weather_id` as a
+persistent cross-run identifier.
+
+The current implementation uses a signed 32-bit integer for `weather_id`.
+This is sufficient for the approximately 62,000 rows in the exercise, but
+would need reconsideration for much larger snapshots.
+
+If stable surrogate keys across runs were required, a persistent key mapping
+or a different ID design would be necessary. Sequential numbering alone
+cannot provide that guarantee.
 
 **Loading strategy: full snapshot, not incremental extraction.**
+
 Neither API supports delta extraction (REST Countries returns a snapshot;
 Open-Meteo returns a date range). At ~27 cities × ~97 days × 24 hours ≈ 62k
-rows, a full re-fetch is a simple choice for this take-home. The pipeline
-deliberately re-fetches each run and applies these rules:
+rows, a full re-fetch is a simple choice for this take-home.
 
-1. All records are unioned into one DataFrame.
-2. `row_number()` over `(city_id, timestamp_utc)` keeps exactly one row per
-   hour, ordered by `is_forecast` (actuals first), then `source_priority`
+The pipeline deliberately re-fetches each run and applies these rules:
+
+1. Historical and forecast records are combined into one DataFrame.
+2. `is_forecast` is recomputed relative to the current run time.
+3. Rows with null temperatures are excluded.
+4. The result is filtered to `[now - 90 days, now + 7 days]`.
+5. For each `(city_id, timestamp_utc)`, `row_number()` keeps exactly one
+   row, ordered by `is_forecast` (historical first), then `source_priority`
    (archive before forecast endpoint). If equally preferred records disagree
-   on temperature, the run fails rather than silently choosing a value.
-3. The result is filtered to `[now - 90 days, now + 7 days]`.
-4. Stable IDs are checked for collisions, then each output is written with
-   `.mode("overwrite")` and `coalesce(1)`.
+   on temperature, the run fails instead of selecting an arbitrary value.
+6. Sequential `weather_id` values are assigned to the deduplicated snapshot
+   in `(city_id, timestamp_utc)` order.
+7. Each output is written with `.mode("overwrite")` and `coalesce(1)`.
 
-This avoids accumulating duplicates across runs. It does **not** promise that
-two live runs have identical content: the upstream forecast can change, and
-the rolling window moves with `now`. The idempotency test fixes `now` and the
-input data, then compares logical rows rather than file bytes or row order.
+This avoids accumulating duplicates across runs. It does **not** promise
+that two live runs have identical content: the upstream forecast can change,
+and the rolling window moves with `now`.
 
-**Failure handling.** Failed API calls retry with exponential backoff (5
-attempts, retrying HTTP 429 and 5xx responses and honouring integer or
-HTTP-date `Retry-After` values when valid).
+The idempotency test fixes `now` and the input data, then compares logical
+rows rather than file bytes or row order.
+
+**Failure handling.**
+
+Failed API calls retry with exponential backoff (5 attempts, retrying HTTP
+429 and 5xx responses and honouring integer or HTTP-date `Retry-After`
+values when valid).
 
 If a required API call fails after retries, extraction aborts before either
 output is written. However, the two output writes are independent: if the city
@@ -106,11 +143,13 @@ write succeeds and the weather write then fails, the published files can
 represent different runs. This small solution does not provide atomic
 publication of the pair.
 
-If consumers required a consistent multi-file snapshot, the next step would be
-to write both datasets to a new versioned staging directory, validate them,
-and publish the completed snapshot through a single commit or pointer update
-supported by the target storage system. Two independent file renames alone
-would not guarantee atomic publication of the pair.
+If consumers required a consistent multi-file snapshot, the next step would
+be to write both datasets to a new versioned staging directory, validate
+them, and publish the completed snapshot through a single commit or pointer
+update supported by the target storage system.
+
+Two independent file renames alone would not guarantee atomic publication
+of the pair.
 
 ## How forecasts changing and becoming historical are handled
 
@@ -141,9 +180,9 @@ would not guarantee atomic publication of the pair.
 - Rows with a null temperature are dropped: a null must not mask a real
   reading during deduplication.
 - Open-Meteo's forecast endpoint returns 7 *calendar* days starting from the
-  current day, so forecast coverage ends at 23:00 UTC of day 7 and may be up
-  to ~24 hours short of `now + 7×24h`. The observed span is ~96 days rather
-  than 97.
+  current day, so forecast coverage ends at 23:00 UTC of day 7 and may be
+  up to ~24 hours short of `now + 7×24h`. The observed span is ~96 days
+  rather than 97.
 - The pipeline is a single-process run (`local[*]`); no scheduler is included,
   by design for this exercise.
 - `data/` is regenerated on every run and is not meant to be committed.
@@ -167,3 +206,6 @@ Brief notes; the interview will cover each in more depth.
   per `(city_id, timestamp_utc)`. A separate validity model using `valid_from`
   and `valid_to` could be introduced if consumers require SCD Type 2-style
   history.
+- For weather datasets too large for a global sequential sort, revisit the
+  surrogate-key strategy. The current `row_number()` approach is intentionally
+  simple and suitable for this small full-snapshot pipeline.
