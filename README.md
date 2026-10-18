@@ -1,3 +1,4 @@
+
 # EU Capital Weather Pipeline
 
 PySpark pipeline that fetches EU capital city metadata from **REST Countries**
@@ -51,14 +52,14 @@ production, a secrets manager (Key Vault, Secrets Manager, Vault) would
 inject the same variable at runtime — the code path does not change.
 
 > **Windows notes.** Two Windows-specific setup steps are needed:
-> 1. PySpark 3.5.x's bundled `cloudpickle` is incompatible with Python 3.13+, 
->    and Spark workers must use the venv interpreter rather than the Microsoft 
->    Store `python` alias. Both `pipeline.py` and `conftest.py` set 
+> 1. PySpark 3.5.x's bundled `cloudpickle` is incompatible with Python 3.13+,
+>    and Spark workers must use the venv interpreter rather than the Microsoft
+>    Store `python` alias. Both `pipeline.py` and `conftest.py` set
 >    `PYSPARK_PYTHON` from `sys.executable` at import time to prevent this.
-> 2. Writing Parquet requires `winutils.exe` and `hadoop.dll` (Hadoop 3.3.5) 
->    on `PATH`. Place them at `C:\hadoop\bin`. The pipeline will automatically 
->    detect this location and configure `HADOOP_HOME` and `PATH` for you. 
->    (If installed elsewhere, set `HADOOP_HOME` and prepend its `bin` folder 
+> 2. Writing Parquet requires `winutils.exe` and `hadoop.dll` (Hadoop 3.3.5)
+>    on `PATH`. Place them at `C:\hadoop\bin`. The pipeline will automatically
+>    detect this location and configure `HADOOP_HOME` and `PATH` for you.
+>    (If installed elsewhere, set `HADOOP_HOME` and prepend its `bin` folder
 >    to `PATH` manually).
 
 ## Approach: IDs and incremental loading
@@ -84,11 +85,11 @@ deliberately re-fetches each run and applies these rules:
 1. All records are unioned into one DataFrame.
 2. `row_number()` over `(city_id, timestamp_utc)` keeps exactly one row per
    hour, ordered by `is_forecast` (actuals first), then `source_priority`
-  (archive before forecast endpoint). If equally preferred records disagree
-  on temperature, the run fails rather than silently choosing a value.
+   (archive before forecast endpoint). If equally preferred records disagree
+   on temperature, the run fails rather than silently choosing a value.
 3. The result is filtered to `[now - 90 days, now + 7 days]`.
 4. Stable IDs are checked for collisions, then each output is written with
-  `.mode("overwrite")` and `coalesce(1)`.
+   `.mode("overwrite")` and `coalesce(1)`.
 
 This avoids accumulating duplicates across runs. It does **not** promise that
 two live runs have identical content: the upstream forecast can change, and
@@ -96,7 +97,9 @@ the rolling window moves with `now`. The idempotency test fixes `now` and the
 input data, then compares logical rows rather than file bytes or row order.
 
 **Failure handling.** Failed API calls retry with exponential backoff (5
-attempts, retrying HTTP 429 and 5xx responses and honouring integer or HTTP-date `Retry-After` values when valid).
+attempts, retrying HTTP 429 and 5xx responses and honouring integer or
+HTTP-date `Retry-After` values when valid).
+
 If a required API call fails after retries, extraction aborts before either
 output is written. However, the two output writes are independent: if the city
 write succeeds and the weather write then fails, the published files can
@@ -149,17 +152,18 @@ would not guarantee atomic publication of the pair.
 
 Brief notes; the interview will cover each in more depth.
 
-- Batch Open-Meteo calls (the API accepts comma-separated coordinates) and
-  checkpoint per-city responses so a failed call falls back to the last
-  successful response rather than aborting the run — i.e. add a **Dead-Letter
-  Queue** (Konieczny Ch. 3; Kimball Subsystem 24).
+- Batch Open-Meteo requests where appropriate, and consider checkpointing
+  successful responses to support recovery or controlled fallback after
+  transient API failures. Use a dead-letter queue for failed records that
+  require later investigation or reprocessing.
 - If per-table transactional writes and incremental updates become necessary,
   consider **Delta Lake** and `MERGE` on `(city_id, timestamp_utc)`. A Delta
   transaction would protect an individual table; two separate tables still
   need a publication strategy if consumers require an atomic pair.
 - Partition `weather.parquet` by `country_code` (or `date`) to avoid
   single-file scaling limits.
-- To retain the forecast known at each point in time, add a `forecast_run_ts`
-  column and stop deduplicating across runs — the table becomes an SCD Type 2
-  over forecasts, with `is_forecast` and `valid_from/valid_to` capturing when
-  each forecast was superseded.
+- To preserve forecasts as they were known at different points in time, store
+  a `forecast_run_ts` alongside each forecast and retain multiple versions
+  per `(city_id, timestamp_utc)`. A separate validity model using `valid_from`
+  and `valid_to` could be introduced if consumers require SCD Type 2-style
+  history.
