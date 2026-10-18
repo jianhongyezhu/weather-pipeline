@@ -48,9 +48,14 @@ def test_parse_hourly_weather_raises_on_length_mismatch():
 def test_fetch_historical_weather_sends_expected_request(monkeypatch):
     fake_response = Mock(json=Mock(return_value={"hourly": {}}))
     fake_get = Mock(return_value=fake_response)
-    monkeypatch.setattr("weather_pipeline.weather_client.requests.get", fake_get)
+    monkeypatch.setattr(
+        "weather_pipeline.weather_client.requests.get",
+        fake_get,
+    )
 
-    result = fetch_historical_weather(48.2, 16.37, "2026-07-19", "2026-10-16")
+    result = fetch_historical_weather(
+        48.2, 16.37, "2026-07-19", "2026-10-16"
+    )
 
     assert result == {"hourly": {}}
     fake_get.assert_called_once_with(
@@ -71,7 +76,10 @@ def test_fetch_historical_weather_sends_expected_request(monkeypatch):
 def test_fetch_forecast_weather_sends_expected_request(monkeypatch):
     fake_response = Mock(json=Mock(return_value={"hourly": {}}))
     fake_get = Mock(return_value=fake_response)
-    monkeypatch.setattr("weather_pipeline.weather_client.requests.get", fake_get)
+    monkeypatch.setattr(
+        "weather_pipeline.weather_client.requests.get",
+        fake_get,
+    )
 
     fetch_forecast_weather(48.2, 16.37)
 
@@ -81,7 +89,7 @@ def test_fetch_forecast_weather_sends_expected_request(monkeypatch):
             "latitude": 48.2,
             "longitude": 16.37,
             "hourly": "temperature_2m",
-            "forecast_days": 7,
+            "forecast_days": 8,
             "past_days": 7,
             "timezone": "UTC",
             "temperature_unit": "celsius",
@@ -92,7 +100,9 @@ def test_fetch_forecast_weather_sends_expected_request(monkeypatch):
 
 def test_fetch_forecast_weather_raises_on_http_error(monkeypatch):
     fake_response = Mock()
-    fake_response.raise_for_status.side_effect = requests.HTTPError("Server error")
+    fake_response.raise_for_status.side_effect = requests.HTTPError(
+        "Server error"
+    )
     monkeypatch.setattr(
         "weather_pipeline.weather_client.requests.get",
         Mock(return_value=fake_response),

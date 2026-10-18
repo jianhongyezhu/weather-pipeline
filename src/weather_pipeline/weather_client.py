@@ -31,15 +31,19 @@ def fetch_historical_weather(latitude, longitude, start_date, end_date):
 def fetch_forecast_weather(latitude, longitude):
     """Fetch hourly temperatures for one location.
 
-    Returns `forecast_days` of future hours plus `past_days` of recent past
-    hours. The past hours exist because the archive endpoint lags real time
-    by ~5 days; the pipeline reclassifies them as historical by timestamp.
+    Request eight calendar days so a run at any time of day can cover
+    the full rolling seven-day future window. The transformation layer
+    trims the response to now + 7 days.
+
+    Also request seven past calendar days because the archive endpoint
+    can lag behind real time. The pipeline classifies those records
+    relative to the run timestamp.
     """
     params = {
         "latitude": latitude,
         "longitude": longitude,
         "hourly": "temperature_2m",
-        "forecast_days": 7,
+        "forecast_days": 8,
         "past_days": 7,
         "timezone": "UTC",
         "temperature_unit": "celsius",
